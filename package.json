@@ -1,0 +1,25 @@
+{
+  "name": "openclaw-mirror-daemon",
+  "version": "1.0.0",
+  "description": "A lightweight Node.js utility to automatically mirror messages between different OpenClaw channels (e.g., Webchat to Telegram) without incurring additional LLM token costs.",
+  "main": "mirror_daemon.js",
+  "scripts": {
+    "test": "jest",
+    "start": "node mirror_daemon.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/liaosvcaf/openclaw-mirror-daemon.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/liaosvcaf/openclaw-mirror-daemon/issues"
+  },
+  "homepage": "https://github.com/liaosvcaf/openclaw-mirror-daemon#readme",
+  "devDependencies": {
+    "jest": "^30.2.0"
+  }
+}
