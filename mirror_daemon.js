@@ -1,65 +1,166 @@
 const fs = require('fs');
-const { spawn, execSync } = require('child_process');
 const path = require('path');
+const spawn = require('child_process').spawn;
+const { execSync } = require('child_process');
 
-// === Config ===
-const SESSIONS_DIR = '/Users/liao/.openclaw/agents/main/sessions';
-const SESSIONS_JSON = path.join(SESSIONS_DIR, 'sessions.json');
+const LOG_DIR = '/tmp/openclaw';
+const SESSIONS_DIR = path.join(process.env.HOME || '/Users/liao', '.openclaw/agents/main/sessions');
 const TELEGRAM_TARGET = '7380936103';
-const MIRROR_TAG = '[mirrored]';
-const POLL_INTERVAL_MS = 5000;
+const IGNORE_TAG = '[mirrored]';
 const CACHE_SIZE = 50;
-
-// === State ===
-let currentSessionId = null;
-let currentFilePath = null;
-let currentTail = null;
-let lastLineCount = 0;
-let prevUserIsWebchat = false;
 const mirroredCache = new Set();
 
-// === Helpers ===
+// Track which runIds we've already processed to avoid duplicates
+const processedRuns = new Set();
+const PROCESSED_RUNS_MAX = 100;
 
-function getActiveSessionId() {
+let currentTail = null;
+let currentLogDate = null;
+
+// --- Exported helpers for testing ---
+
+/**
+ * Parse the subsystem from entry["0"], which is a JSON string like '{"subsystem":"agent/embedded"}'
+ */
+function parseSubsystem(entry) {
+    const field0 = entry && entry['0'];
+    if (!field0 || typeof field0 !== 'string') return null;
     try {
-        const data = JSON.parse(fs.readFileSync(SESSIONS_JSON, 'utf8'));
-        const main = data['agent:main:main'];
-        return main ? main.sessionId : null;
-    } catch (e) {
+        const parsed = JSON.parse(field0);
+        return parsed.subsystem || null;
+    } catch {
         return null;
     }
 }
 
-function isWebchatUserMessage(text) {
-    if (!text || typeof text !== 'string') return false;
-    // Webchat messages have UUID-style message_ids and no channel prefix
-    if (text.startsWith('[Telegram')) return false;
-    if (text.startsWith('System:')) return false;
-    if (text.startsWith('[Queued')) return false;
-    if (text.startsWith('[Audio]')) return false;
-    // Must have a message_id (all real messages do)
-    if (!text.includes('message_id:')) return false;
-    // UUID message_id pattern (webchat uses UUIDs, telegram uses numbers)
-    const match = text.match(/\[message_id:\s*([^\]]+)\]/);
-    if (!match) return false;
-    const id = match[1].trim();
-    // Telegram message_ids are numeric; webchat are UUIDs
-    return /[a-f0-9-]{36}/.test(id);
+/**
+ * Parse a log line and determine if it's a webchat "run done" event.
+ * Returns { sessionId, runId } if it is, null otherwise.
+ */
+function parseWebchatRunDone(line) {
+    if (!line || !line.trim()) return null;
+    let entry;
+    try {
+        entry = JSON.parse(line);
+    } catch {
+        return null;
+    }
+
+    const subsystem = parseSubsystem(entry);
+    if (subsystem !== 'agent/embedded') return null;
+
+    const msg = entry['1'];
+    if (typeof msg !== 'string') return null;
+
+    if (!msg.includes('embedded run done:')) return null;
+
+    const sessionMatch = msg.match(/sessionId=([a-zA-Z0-9_-]+)/);
+    const runMatch = msg.match(/runId=([a-zA-Z0-9_-]+)/);
+    if (!sessionMatch || !runMatch) return null;
+
+    return { sessionId: sessionMatch[1], runId: runMatch[1] };
 }
 
-function extractAssistantText(content) {
-    if (!Array.isArray(content)) return null;
-    const texts = [];
-    for (const part of content) {
-        if (part && part.type === 'text' && part.text && part.text.trim()) {
-            texts.push(part.text.trim());
-        }
+/**
+ * Parse a log line and determine if it's an "embedded run start" event.
+ * Returns { sessionId, runId, messageChannel } if it is, null otherwise.
+ */
+function parseRunStart(line) {
+    if (!line || !line.trim()) return null;
+    let entry;
+    try {
+        entry = JSON.parse(line);
+    } catch {
+        return null;
     }
-    return texts.length > 0 ? texts.join('\n\n') : null;
+
+    const subsystem = parseSubsystem(entry);
+    if (subsystem !== 'agent/embedded') return null;
+
+    const msg = entry['1'];
+    if (typeof msg !== 'string') return null;
+
+    if (!msg.includes('embedded run start:')) return null;
+
+    const sessionMatch = msg.match(/sessionId=([a-zA-Z0-9_-]+)/);
+    const runMatch = msg.match(/runId=([a-zA-Z0-9_-]+)/);
+    const channelMatch = msg.match(/messageChannel=(\S+)/);
+    if (!sessionMatch || !runMatch || !channelMatch) return null;
+
+    return {
+        sessionId: sessionMatch[1],
+        runId: runMatch[1],
+        messageChannel: channelMatch[1],
+    };
+}
+
+/**
+ * Read the last assistant text message from a session JSONL file.
+ * Returns the text content or null.
+ */
+function getLastAssistantText(sessionId) {
+    const filePath = path.join(SESSIONS_DIR, sessionId + '.jsonl');
+    if (!fs.existsSync(filePath)) return null;
+
+    try {
+        const content = fs.readFileSync(filePath, 'utf8');
+        const lines = content.trim().split('\n');
+
+        for (let i = lines.length - 1; i >= 0; i--) {
+            try {
+                const entry = JSON.parse(lines[i]);
+                if (entry.type !== 'message') continue;
+                if (!entry.message || entry.message.role !== 'assistant') continue;
+
+                const contentArr = entry.message.content;
+                if (!Array.isArray(contentArr)) continue;
+
+                const textParts = contentArr
+                    .filter(c => c.type === 'text' && c.text)
+                    .map(c => c.text.trim())
+                    .filter(t => t.length > 0);
+
+                if (textParts.length > 0) {
+                    return textParts.join('\n');
+                }
+            } catch {
+                continue;
+            }
+        }
+    } catch {
+        return null;
+    }
+
+    return null;
+}
+
+/**
+ * Check if text should be ignored (echo loop prevention).
+ */
+function shouldIgnore(text) {
+    if (!text) return true;
+    if (text.includes(IGNORE_TAG)) return true;
+    if (text.trim().length === 0) return true;
+    return false;
+}
+
+// --- End exported helpers ---
+
+function getLogPath() {
+    const now = new Date();
+    const yyyy = now.getFullYear();
+    const mm = String(now.getMonth() + 1).padStart(2, '0');
+    const dd = String(now.getDate()).padStart(2, '0');
+    return LOG_DIR + '/openclaw-' + yyyy + '-' + mm + '-' + dd + '.log';
+}
+
+function getDateStr() {
+    const now = new Date();
+    return now.getFullYear() + '-' + String(now.getMonth() + 1).padStart(2, '0') + '-' + String(now.getDate()).padStart(2, '0');
 }
 
 function sendToTelegram(text) {
-    if (!text || mirroredCache.has(text)) return;
+    if (mirroredCache.has(text)) return;
 
     mirroredCache.add(text);
     if (mirroredCache.size > CACHE_SIZE) {
@@ -67,125 +168,142 @@ function sendToTelegram(text) {
         mirroredCache.delete(first);
     }
 
-    // Truncate very long messages (Telegram limit ~4096 chars)
-    const maxLen = 3900;
-    let sendText = text.length > maxLen ? text.substring(0, maxLen) + '\n\n[...truncated]' : text;
+    let sendText = text;
+    if (sendText.length > 3900) {
+        sendText = sendText.substring(0, 3900) + '\n\n[...truncated]';
+    }
 
     const escaped = sendText.replace(/"/g, '\\"').replace(/\$/g, '\\$').replace(/`/g, '\\`');
-    const command = `openclaw message send --target "${TELEGRAM_TARGET}" --message "${MIRROR_TAG} ${escaped}"`;
+    const command = 'openclaw message send --target "' + TELEGRAM_TARGET + '" --message "' + IGNORE_TAG + ' ' + escaped + '"';
     try {
-        execSync(command, { timeout: 15000, stdio: 'pipe' });
-        console.log(`[Mirror] Sent to Telegram: ${text.substring(0, 80)}...`);
+        execSync(command, { timeout: 15000 });
+        console.log('[Sent to Telegram] ' + text.substring(0, 80) + '...');
     } catch (err) {
-        console.error(`[Mirror] Failed to send: ${err.message}`);
+        console.error('Failed to send: ' + err.message);
     }
 }
+
+// Track webchat runs: when we see "run start" with messageChannel=webchat,
+// record the runId. When we see "run done" with that runId, fetch the response.
+const webchatRuns = new Map(); // runId -> sessionId
 
 function processLine(line) {
-    if (!line.trim()) return;
-    let entry;
-    try {
-        entry = JSON.parse(line);
-    } catch (e) {
+    if (!line || !line.trim()) return;
+
+    const startInfo = parseRunStart(line);
+    if (startInfo) {
+        if (startInfo.messageChannel === 'webchat') {
+            webchatRuns.set(startInfo.runId, startInfo.sessionId);
+            console.log('[Mirror] Tracking webchat run: ' + startInfo.runId + ' session=' + startInfo.sessionId);
+        }
         return;
     }
 
-    const msg = entry.message;
-    if (!msg) return;
-    const role = msg.role;
-    const content = msg.content;
+    const doneInfo = parseWebchatRunDone(line);
+    if (!doneInfo) return;
 
-    if (role === 'user') {
-        // Check if this is a webchat user message
-        let text = '';
-        if (Array.isArray(content) && content.length > 0) {
-            const first = content[0];
-            text = (first && typeof first === 'object') ? (first.text || '') : String(first || '');
-        } else if (typeof content === 'string') {
-            text = content;
-        }
-        prevUserIsWebchat = isWebchatUserMessage(text);
-    } else if (role === 'assistant' && prevUserIsWebchat) {
-        const text = extractAssistantText(content);
-        if (text) {
+    const sessionId = webchatRuns.get(doneInfo.runId);
+    if (!sessionId) return;
+
+    webchatRuns.delete(doneInfo.runId);
+
+    if (processedRuns.has(doneInfo.runId)) return;
+    processedRuns.add(doneInfo.runId);
+    if (processedRuns.size > PROCESSED_RUNS_MAX) {
+        const first = processedRuns.values().next().value;
+        processedRuns.delete(first);
+    }
+
+    console.log('[Mirror] Webchat run done: ' + doneInfo.runId + ' session=' + sessionId);
+
+    setTimeout(function() {
+        const text = getLastAssistantText(sessionId);
+        if (text && !shouldIgnore(text)) {
             sendToTelegram(text);
+        } else {
+            console.log('[Mirror] No text to mirror for run ' + doneInfo.runId);
         }
-        // Don't reset prevUserIsWebchat here -- multi-turn tool calls
-        // between user and final assistant text reply are common.
-        // We reset only on the next user message.
-    }
-    // toolResult and other roles: don't change state
+    }, 500);
 }
 
-function processFile(filePath) {
-    try {
-        const data = fs.readFileSync(filePath, 'utf8');
-        const lines = data.split('\n');
-        // Only process new lines
-        if (lines.length > lastLineCount) {
-            const newLines = lines.slice(lastLineCount);
-            for (const line of newLines) {
-                processLine(line);
-            }
-            lastLineCount = lines.length;
-        }
-    } catch (e) {
-        // File might be mid-write
+function startTailing(logPath) {
+    if (currentTail) {
+        currentTail.kill();
+        currentTail = null;
     }
+
+    console.log('[Mirror] Tailing ' + logPath);
+    const tail = spawn('tail', ['-F', logPath]);
+    currentTail = tail;
+
+    tail.stdout.on('data', function(data) {
+        const lines = data.toString().split('\n');
+        for (const line of lines) {
+            processLine(line);
+        }
+    });
+
+    tail.stderr.on('data', function(data) {
+        console.error('Tail stderr: ' + data);
+    });
+
+    tail.on('exit', function(code) {
+        console.log('[Mirror] tail exited with code ' + code);
+    });
 }
 
-function watchSession() {
-    const sessionId = getActiveSessionId();
-    if (!sessionId) {
-        console.log('[Mirror] No active session found, waiting...');
-        return;
-    }
-
-    if (sessionId !== currentSessionId) {
-        console.log(`[Mirror] Session changed: ${currentSessionId} -> ${sessionId}`);
-        currentSessionId = sessionId;
-        currentFilePath = path.join(SESSIONS_DIR, `${sessionId}.jsonl`);
-        lastLineCount = 0;
-        prevUserIsWebchat = false;
-
-        // Scan existing content to initialize state (don't mirror old messages)
-        try {
-            const data = fs.readFileSync(currentFilePath, 'utf8');
-            const lines = data.split('\n');
-            lastLineCount = lines.length;
-            // Set prevUserIsWebchat based on last user message
-            for (let i = lines.length - 1; i >= 0; i--) {
-                if (!lines[i].trim()) continue;
-                try {
-                    const entry = JSON.parse(lines[i]);
-                    if (entry.message && entry.message.role === 'user') {
-                        let text = '';
-                        const content = entry.message.content;
-                        if (Array.isArray(content) && content.length > 0) {
-                            const first = content[0];
-                            text = (first && typeof first === 'object') ? (first.text || '') : String(first || '');
-                        }
-                        prevUserIsWebchat = isWebchatUserMessage(text);
-                        break;
-                    }
-                } catch (e) {}
-            }
-            console.log(`[Mirror] Initialized at line ${lastLineCount}, webchat=${prevUserIsWebchat}`);
-        } catch (e) {
-            console.log(`[Mirror] Session file not yet available: ${currentFilePath}`);
+function watchForDateChange() {
+    setInterval(function() {
+        const newDate = getDateStr();
+        if (newDate !== currentLogDate) {
+            console.log('[Mirror] Date changed: ' + currentLogDate + ' -> ' + newDate);
+            currentLogDate = newDate;
+            webchatRuns.clear();
+            startTailing(getLogPath());
         }
-    }
-
-    if (currentFilePath && fs.existsSync(currentFilePath)) {
-        processFile(currentFilePath);
-    }
+    }, 60000);
 }
 
-// === Main Loop ===
-console.log(`[Mirror] Daemon starting (PID ${process.pid})`);
+function waitForLogAndStart() {
+    var check = function() {
+        var logPath = getLogPath();
+        if (fs.existsSync(logPath)) {
+            currentLogDate = getDateStr();
+            startTailing(logPath);
+            watchForDateChange();
+        } else {
+            console.log('[Mirror] Waiting for ' + logPath + ' ...');
+            setTimeout(check, 5000);
+        }
+    };
+    check();
+}
 
-setInterval(watchSession, POLL_INTERVAL_MS);
-watchSession(); // Initial check
+// Only start daemon when run directly (not when required for testing)
+if (require.main === module) {
+    console.log('[Mirror] Daemon starting (PID ' + process.pid + ')');
+    waitForLogAndStart();
 
-process.on('SIGTERM', () => process.exit(0));
-process.on('SIGINT', () => process.exit(0));
+    process.on('SIGTERM', function() {
+        if (currentTail) currentTail.kill();
+        process.exit(0);
+    });
+    process.on('SIGINT', function() {
+        if (currentTail) currentTail.kill();
+        process.exit(0);
+    });
+}
+
+// Export for testing
+module.exports = {
+    parseSubsystem: parseSubsystem,
+    parseWebchatRunDone: parseWebchatRunDone,
+    parseRunStart: parseRunStart,
+    getLastAssistantText: getLastAssistantText,
+    shouldIgnore: shouldIgnore,
+    processLine: processLine,
+    webchatRuns: webchatRuns,
+    processedRuns: processedRuns,
+    mirroredCache: mirroredCache,
+    IGNORE_TAG: IGNORE_TAG,
+};

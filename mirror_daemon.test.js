@@ -1,463 +1,487 @@
-/**
- * Regression tests for mirror_daemon.js
- *
- * Tests the core logic: webchat detection, assistant text extraction,
- * message processing pipeline, session switching, and dedup cache.
- *
- * We extract and test the pure functions directly, and mock execSync
- * for the send-to-Telegram path.
- */
-
 const fs = require('fs');
 const path = require('path');
-const { execSync } = require('child_process');
 
-// --- Extract functions from mirror_daemon.js via eval ---
-// We load the source and extract the function bodies to test them in isolation.
+// Mock execSync before requiring the module
+jest.mock('child_process', () => ({
+    ...jest.requireActual('child_process'),
+    execSync: jest.fn(),
+    spawn: jest.fn(() => ({
+        stdout: { on: jest.fn() },
+        stderr: { on: jest.fn() },
+        on: jest.fn(),
+        kill: jest.fn(),
+    })),
+}));
 
-let isWebchatUserMessage;
-let extractAssistantText;
-let processLine;
-let sendToTelegram;
-let mirroredCache;
-let prevUserIsWebchat;
+const {
+    parseSubsystem,
+    parseWebchatRunDone,
+    parseRunStart,
+    getLastAssistantText,
+    shouldIgnore,
+    processLine,
+    webchatRuns,
+    processedRuns,
+    mirroredCache,
+    IGNORE_TAG,
+} = require('./mirror_daemon');
 
-// Mock execSync globally
-jest.mock('child_process', () => {
-    const actual = jest.requireActual('child_process');
-    return {
-        ...actual,
-        execSync: jest.fn(),
-        spawn: jest.fn(() => ({
-            stdout: { on: jest.fn() },
-            stderr: { on: jest.fn() },
-            on: jest.fn(),
-            kill: jest.fn(),
-        })),
+// --- Helpers to build realistic log lines ---
+
+function makeLogLine(subsystem, message, extra) {
+    var entry = {
+        '0': JSON.stringify({ subsystem: subsystem }),
+        '1': message,
+        _meta: {
+            runtime: 'node',
+            runtimeVersion: '25.5.0',
+            hostname: 'unknown',
+            name: JSON.stringify({ subsystem: subsystem }),
+            parentNames: ['openclaw'],
+            date: new Date().toISOString(),
+            logLevelId: 2,
+            logLevelName: 'DEBUG',
+        },
+        time: new Date().toISOString(),
     };
-});
+    if (extra) Object.assign(entry, extra);
+    return JSON.stringify(entry);
+}
 
-// Mock fs for session file reads in the daemon
-jest.mock('fs', () => {
-    const actual = jest.requireActual('fs');
-    return {
-        ...actual,
-        readFileSync: jest.fn((...args) => actual.readFileSync(...args)),
-        existsSync: jest.fn((...args) => actual.existsSync(...args)),
-    };
-});
+function makePlainLogLine(message) {
+    return JSON.stringify({
+        '0': message,
+        _meta: {
+            runtime: 'node',
+            name: 'openclaw',
+            date: new Date().toISOString(),
+            logLevelId: 3,
+            logLevelName: 'INFO',
+        },
+        time: new Date().toISOString(),
+    });
+}
 
-// Re-implement the core functions directly for testing
-// (Avoids loading the daemon which starts timers)
-beforeAll(() => {
-    isWebchatUserMessage = function(text) {
-        if (!text || typeof text !== 'string') return false;
-        if (text.startsWith('[Telegram')) return false;
-        if (text.startsWith('System:')) return false;
-        if (text.startsWith('[Queued')) return false;
-        if (text.startsWith('[Audio]')) return false;
-        if (!text.includes('message_id:')) return false;
-        const match = text.match(/\[message_id:\s*([^\]]+)\]/);
-        if (!match) return false;
-        const id = match[1].trim();
-        return /[a-f0-9-]{36}/.test(id);
-    };
+function makeRunStartLine(runId, sessionId, channel) {
+    return makeLogLine(
+        'agent/embedded',
+        'embedded run start: runId=' + runId + ' sessionId=' + sessionId + ' provider=anthropic model=claude-opus-4-5 thinking=low messageChannel=' + channel
+    );
+}
 
-    extractAssistantText = function(content) {
-        if (!Array.isArray(content)) return null;
-        const texts = [];
-        for (const part of content) {
-            if (part && part.type === 'text' && part.text && part.text.trim()) {
-                texts.push(part.text.trim());
-            }
-        }
-        return texts.length > 0 ? texts.join('\n\n') : null;
-    };
-});
+function makeRunDoneLine(runId, sessionId) {
+    return makeLogLine(
+        'agent/embedded',
+        'embedded run done: runId=' + runId + ' sessionId=' + sessionId + ' durationMs=4881 aborted=false'
+    );
+}
 
-// ============================================================
-// isWebchatUserMessage
-// ============================================================
-describe('isWebchatUserMessage', () => {
-    test('returns true for webchat message with UUID message_id', () => {
-        const text = 'hello world\n[message_id: a8733e42-3dce-4de0-8dfc-4d8e1aaf7e4a]';
-        expect(isWebchatUserMessage(text)).toBe(true);
+// --- Tests ---
+
+describe('parseSubsystem', function() {
+    test('parses subsystem from structured entry', function() {
+        var entry = { '0': '{"subsystem":"agent/embedded"}' };
+        expect(parseSubsystem(entry)).toBe('agent/embedded');
     });
 
-    test('returns false for Telegram message with numeric message_id', () => {
-        const text = '[Telegram Chunhua Liao id:7380936103 +10s 2026-02-02 22:09 PST] hello\n[message_id: 419]';
-        expect(isWebchatUserMessage(text)).toBe(false);
+    test('parses gateway/ws subsystem', function() {
+        var entry = { '0': '{"subsystem":"gateway/ws"}' };
+        expect(parseSubsystem(entry)).toBe('gateway/ws');
     });
 
-    test('returns false for System messages', () => {
-        const text = 'System: [2026-02-02 22:15:49 PST] Exec failed\n[message_id: abc]';
-        expect(isWebchatUserMessage(text)).toBe(false);
+    test('returns null for plain string entry', function() {
+        var entry = { '0': 'Registered hook: boot-md -> gateway:startup' };
+        expect(parseSubsystem(entry)).toBeNull();
     });
 
-    test('returns false for Queued messages', () => {
-        const text = '[Queued messages while agent was busy]\n[message_id: a8733e42-3dce-4de0-8dfc-4d8e1aaf7e4a]';
-        expect(isWebchatUserMessage(text)).toBe(false);
+    test('returns null for null/undefined entry', function() {
+        expect(parseSubsystem(null)).toBeNull();
+        expect(parseSubsystem(undefined)).toBeNull();
+        expect(parseSubsystem({})).toBeNull();
     });
 
-    test('returns false for Audio messages', () => {
-        const text = '[Audio] User text: something\n[message_id: a8733e42-3dce-4de0-8dfc-4d8e1aaf7e4a]';
-        expect(isWebchatUserMessage(text)).toBe(false);
-    });
-
-    test('returns false for null/empty input', () => {
-        expect(isWebchatUserMessage(null)).toBe(false);
-        expect(isWebchatUserMessage('')).toBe(false);
-        expect(isWebchatUserMessage(undefined)).toBe(false);
-    });
-
-    test('returns false for non-string input', () => {
-        expect(isWebchatUserMessage(42)).toBe(false);
-        expect(isWebchatUserMessage({})).toBe(false);
-    });
-
-    test('returns false for message without message_id', () => {
-        expect(isWebchatUserMessage('just some text')).toBe(false);
-    });
-
-    test('returns false for numeric-only message_id (Telegram style)', () => {
-        const text = 'some text\n[message_id: 12345]';
-        expect(isWebchatUserMessage(text)).toBe(false);
-    });
-
-    test('handles message_id with no space after colon', () => {
-        const text = 'hi\n[message_id:a8733e42-3dce-4de0-8dfc-4d8e1aaf7e4a]';
-        expect(isWebchatUserMessage(text)).toBe(true);
-    });
-
-    test('handles multiline webchat messages', () => {
-        const text = 'line 1\nline 2\nline 3\n[message_id: f94aa139-dfd3-4067-92e5-67da097c68e0]';
-        expect(isWebchatUserMessage(text)).toBe(true);
+    test('returns null for non-string field 0', function() {
+        var entry = { '0': 123 };
+        expect(parseSubsystem(entry)).toBeNull();
     });
 });
 
-// ============================================================
-// extractAssistantText
-// ============================================================
-describe('extractAssistantText', () => {
-    test('extracts text from single text part', () => {
-        const content = [{ type: 'text', text: 'Hello, My Lord.' }];
-        expect(extractAssistantText(content)).toBe('Hello, My Lord.');
+describe('parseRunStart', function() {
+    test('detects webchat run start', function() {
+        var line = makeRunStartLine('abc-123', 'sess-456', 'webchat');
+        var result = parseRunStart(line);
+        expect(result).toEqual({
+            sessionId: 'sess-456',
+            runId: 'abc-123',
+            messageChannel: 'webchat',
+        });
     });
 
-    test('concatenates multiple text parts', () => {
-        const content = [
-            { type: 'text', text: 'Part 1' },
-            { type: 'text', text: 'Part 2' },
+    test('detects telegram run start', function() {
+        var line = makeRunStartLine('abc-123', 'sess-456', 'telegram');
+        var result = parseRunStart(line);
+        expect(result).toEqual({
+            sessionId: 'sess-456',
+            runId: 'abc-123',
+            messageChannel: 'telegram',
+        });
+    });
+
+    test('returns null for non-run-start entries', function() {
+        var line = makeLogLine('agent/embedded', 'embedded run tool start: runId=abc tool=read');
+        expect(parseRunStart(line)).toBeNull();
+    });
+
+    test('returns null for empty/null input', function() {
+        expect(parseRunStart('')).toBeNull();
+        expect(parseRunStart(null)).toBeNull();
+        expect(parseRunStart('   ')).toBeNull();
+    });
+
+    test('returns null for non-JSON input', function() {
+        expect(parseRunStart('not json at all')).toBeNull();
+    });
+
+    test('returns null for wrong subsystem', function() {
+        var line = makeLogLine('gateway/ws', 'embedded run start: runId=abc sessionId=def messageChannel=webchat');
+        expect(parseRunStart(line)).toBeNull();
+    });
+});
+
+describe('parseWebchatRunDone', function() {
+    test('detects run done event', function() {
+        var line = makeRunDoneLine('run-123', 'sess-456');
+        var result = parseWebchatRunDone(line);
+        expect(result).toEqual({
+            sessionId: 'sess-456',
+            runId: 'run-123',
+        });
+    });
+
+    test('returns null for run start event', function() {
+        var line = makeRunStartLine('run-123', 'sess-456', 'webchat');
+        expect(parseWebchatRunDone(line)).toBeNull();
+    });
+
+    test('returns null for tool events', function() {
+        var line = makeLogLine('agent/embedded', 'embedded run tool start: runId=abc tool=read toolCallId=toolu_123');
+        expect(parseWebchatRunDone(line)).toBeNull();
+    });
+
+    test('returns null for malformed JSON', function() {
+        expect(parseWebchatRunDone('{invalid json')).toBeNull();
+    });
+
+    test('returns null for non-embedded subsystem', function() {
+        var line = makeLogLine('diagnostic', 'embedded run done: runId=abc sessionId=def durationMs=100');
+        expect(parseWebchatRunDone(line)).toBeNull();
+    });
+
+    test('returns null when entry[1] is an object (not string)', function() {
+        var entry = {
+            '0': '{"subsystem":"agent/embedded"}',
+            '1': { intervalMs: 14400000 },
+            '2': 'heartbeat: started',
+        };
+        expect(parseWebchatRunDone(JSON.stringify(entry))).toBeNull();
+    });
+});
+
+describe('shouldIgnore', function() {
+    test('ignores null/empty text', function() {
+        expect(shouldIgnore(null)).toBe(true);
+        expect(shouldIgnore('')).toBe(true);
+        expect(shouldIgnore('   ')).toBe(true);
+    });
+
+    test('ignores text with [mirrored] tag', function() {
+        expect(shouldIgnore('[mirrored] Hello from webchat')).toBe(true);
+        expect(shouldIgnore('Some text [mirrored] more text')).toBe(true);
+    });
+
+    test('allows normal text', function() {
+        expect(shouldIgnore('Hello, how can I help you?')).toBe(false);
+    });
+});
+
+describe('getLastAssistantText', function() {
+    test('returns null for non-existent session', function() {
+        var result = getLastAssistantText('nonexistent-session-id-12345');
+        expect(result).toBeNull();
+    });
+
+    test('extracts text from assistant message (inline check)', function() {
+        var lines = [
+            JSON.stringify({
+                type: 'message', id: '1',
+                message: { role: 'user', content: [{ type: 'text', text: 'Hello' }] },
+            }),
+            JSON.stringify({
+                type: 'message', id: '2',
+                message: { role: 'assistant', content: [{ type: 'text', text: 'Hi there! How can I help?' }] },
+            }),
         ];
-        expect(extractAssistantText(content)).toBe('Part 1\n\nPart 2');
-    });
-
-    test('ignores toolCall parts', () => {
-        const content = [
-            { type: 'toolCall', id: 'toolu_01X', name: 'exec', arguments: {} },
-        ];
-        expect(extractAssistantText(content)).toBe(null);
-    });
-
-    test('extracts text alongside toolCalls', () => {
-        const content = [
-            { type: 'text', text: 'Running a command...' },
-            { type: 'toolCall', id: 'toolu_01X', name: 'exec', arguments: {} },
-        ];
-        expect(extractAssistantText(content)).toBe('Running a command...');
-    });
-
-    test('returns null for empty content', () => {
-        expect(extractAssistantText([])).toBe(null);
-    });
-
-    test('returns null for non-array', () => {
-        expect(extractAssistantText(null)).toBe(null);
-        expect(extractAssistantText('string')).toBe(null);
-        expect(extractAssistantText(42)).toBe(null);
-    });
-
-    test('skips empty/whitespace-only text parts', () => {
-        const content = [
-            { type: 'text', text: '' },
-            { type: 'text', text: '   ' },
-            { type: 'text', text: 'Real content' },
-        ];
-        expect(extractAssistantText(content)).toBe('Real content');
-    });
-
-    test('handles null parts gracefully', () => {
-        const content = [null, { type: 'text', text: 'ok' }];
-        expect(extractAssistantText(content)).toBe('ok');
-    });
-});
-
-// ============================================================
-// processLine (integration: user -> assistant pipeline)
-// ============================================================
-describe('processLine pipeline', () => {
-    let sentMessages;
-    let _prevUserIsWebchat;
-
-    // Re-implement processLine for testing without daemon state
-    function createProcessor() {
-        let prev = false;
-        const sent = [];
-
-        function process(line) {
-            if (!line.trim()) return;
-            let entry;
-            try { entry = JSON.parse(line); } catch { return; }
-            const msg = entry.message;
-            if (!msg) return;
-
-            if (msg.role === 'user') {
-                let text = '';
-                const content = msg.content;
-                if (Array.isArray(content) && content.length > 0) {
-                    const first = content[0];
-                    text = (first && typeof first === 'object') ? (first.text || '') : String(first || '');
-                } else if (typeof content === 'string') {
-                    text = content;
+        var fileContent = lines.join('\n');
+        var fileLines = fileContent.trim().split('\n');
+        var foundText = null;
+        for (var i = fileLines.length - 1; i >= 0; i--) {
+            var entry = JSON.parse(fileLines[i]);
+            if (entry.type === 'message' && entry.message && entry.message.role === 'assistant') {
+                var textParts = entry.message.content
+                    .filter(function(c) { return c.type === 'text' && c.text; })
+                    .map(function(c) { return c.text.trim(); })
+                    .filter(function(t) { return t.length > 0; });
+                if (textParts.length > 0) {
+                    foundText = textParts.join('\n');
+                    break;
                 }
-                prev = isWebchatUserMessage(text);
-            } else if (msg.role === 'assistant' && prev) {
-                const text = extractAssistantText(msg.content);
-                if (text) sent.push(text);
             }
         }
+        expect(foundText).toBe('Hi there! How can I help?');
+    });
 
-        return { process, sent, isPrevWebchat: () => prev };
-    }
-
-    test('mirrors assistant reply after webchat user message', () => {
-        const proc = createProcessor();
-        proc.process(JSON.stringify({
-            message: {
-                role: 'user',
-                content: [{ type: 'text', text: 'hello\n[message_id: a8733e42-3dce-4de0-8dfc-4d8e1aaf7e4a]' }]
+    test('skips tool calls and returns text-only content', function() {
+        var lines = [
+            JSON.stringify({
+                type: 'message', id: '1',
+                message: { role: 'assistant', content: [{ type: 'toolCall', id: 'tool1', name: 'exec', arguments: { command: 'ls' } }] },
+            }),
+            JSON.stringify({
+                type: 'message', id: '2',
+                message: { role: 'toolResult', toolCallId: 'tool1', content: [{ type: 'text', text: 'file1.txt' }] },
+            }),
+            JSON.stringify({
+                type: 'message', id: '3',
+                message: { role: 'assistant', content: [{ type: 'text', text: 'Here are your files.' }] },
+            }),
+        ];
+        var fileLines = lines;
+        var foundText = null;
+        for (var i = fileLines.length - 1; i >= 0; i--) {
+            var entry = JSON.parse(fileLines[i]);
+            if (entry.type === 'message' && entry.message && entry.message.role === 'assistant') {
+                var textParts = entry.message.content
+                    .filter(function(c) { return c.type === 'text' && c.text; })
+                    .map(function(c) { return c.text.trim(); })
+                    .filter(function(t) { return t.length > 0; });
+                if (textParts.length > 0) {
+                    foundText = textParts.join('\n');
+                    break;
+                }
             }
-        }));
-        proc.process(JSON.stringify({
+        }
+        expect(foundText).toBe('Here are your files.');
+    });
+
+    test('skips thinking blocks', function() {
+        var line = JSON.stringify({
+            type: 'message', id: '1',
             message: {
                 role: 'assistant',
-                content: [{ type: 'text', text: 'Hello, My Lord.' }]
-            }
-        }));
-        expect(proc.sent).toEqual(['Hello, My Lord.']);
-    });
-
-    test('does NOT mirror assistant reply after Telegram user message', () => {
-        const proc = createProcessor();
-        proc.process(JSON.stringify({
-            message: {
-                role: 'user',
-                content: [{ type: 'text', text: '[Telegram User id:123 +5s 2026-02-03 08:00 PST] hi\n[message_id: 500]' }]
-            }
-        }));
-        proc.process(JSON.stringify({
-            message: {
-                role: 'assistant',
-                content: [{ type: 'text', text: 'Hello from Telegram.' }]
-            }
-        }));
-        expect(proc.sent).toEqual([]);
-    });
-
-    test('does NOT mirror assistant reply after System message', () => {
-        const proc = createProcessor();
-        proc.process(JSON.stringify({
-            message: {
-                role: 'user',
-                content: [{ type: 'text', text: 'System: heartbeat\n[message_id: abc]' }]
-            }
-        }));
-        proc.process(JSON.stringify({
-            message: {
-                role: 'assistant',
-                content: [{ type: 'text', text: 'HEARTBEAT_OK' }]
-            }
-        }));
-        expect(proc.sent).toEqual([]);
-    });
-
-    test('handles tool calls between user and final assistant reply', () => {
-        const proc = createProcessor();
-        // Webchat user message
-        proc.process(JSON.stringify({
-            message: {
-                role: 'user',
-                content: [{ type: 'text', text: 'check email\n[message_id: f94aa139-dfd3-4067-92e5-67da097c68e0]' }]
-            }
-        }));
-        // Assistant tool call (no text)
-        proc.process(JSON.stringify({
-            message: {
-                role: 'assistant',
-                content: [{ type: 'toolCall', id: 'toolu_01X', name: 'exec', arguments: {} }]
-            }
-        }));
-        // Tool result
-        proc.process(JSON.stringify({
-            message: {
-                role: 'toolResult',
-                toolCallId: 'toolu_01X',
-                content: [{ type: 'text', text: 'result data' }]
-            }
-        }));
-        // Final assistant reply with text
-        proc.process(JSON.stringify({
-            message: {
-                role: 'assistant',
-                content: [{ type: 'text', text: 'You have 3 unread emails.' }]
-            }
-        }));
-        expect(proc.sent).toEqual(['You have 3 unread emails.']);
-    });
-
-    test('multiple tool call rounds still mirrors final text', () => {
-        const proc = createProcessor();
-        proc.process(JSON.stringify({
-            message: {
-                role: 'user',
-                content: [{ type: 'text', text: 'do something\n[message_id: aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee]' }]
-            }
-        }));
-        // Round 1: tool call + result
-        proc.process(JSON.stringify({ message: { role: 'assistant', content: [{ type: 'toolCall', id: 't1', name: 'exec', arguments: {} }] } }));
-        proc.process(JSON.stringify({ message: { role: 'toolResult', toolCallId: 't1', content: [{ type: 'text', text: 'ok' }] } }));
-        // Round 2: tool call + result
-        proc.process(JSON.stringify({ message: { role: 'assistant', content: [{ type: 'toolCall', id: 't2', name: 'Read', arguments: {} }] } }));
-        proc.process(JSON.stringify({ message: { role: 'toolResult', toolCallId: 't2', content: [{ type: 'text', text: 'data' }] } }));
-        // Final text
-        proc.process(JSON.stringify({ message: { role: 'assistant', content: [{ type: 'text', text: 'All done.' }] } }));
-        expect(proc.sent).toEqual(['All done.']);
-    });
-
-    test('resets webchat state when new Telegram message arrives', () => {
-        const proc = createProcessor();
-        // Webchat message
-        proc.process(JSON.stringify({
-            message: {
-                role: 'user',
-                content: [{ type: 'text', text: 'webchat msg\n[message_id: aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee]' }]
-            }
-        }));
-        expect(proc.isPrevWebchat()).toBe(true);
-        // Telegram message arrives
-        proc.process(JSON.stringify({
-            message: {
-                role: 'user',
-                content: [{ type: 'text', text: '[Telegram User id:123 +5s 2026-02-03 08:00 PST] hello\n[message_id: 500]' }]
-            }
-        }));
-        expect(proc.isPrevWebchat()).toBe(false);
-        // Assistant reply should NOT be mirrored
-        proc.process(JSON.stringify({
-            message: {
-                role: 'assistant',
-                content: [{ type: 'text', text: 'Reply to Telegram user' }]
-            }
-        }));
-        expect(proc.sent).toEqual([]);
-    });
-
-    test('ignores malformed JSON lines', () => {
-        const proc = createProcessor();
-        proc.process('not json at all');
-        proc.process('{broken json');
-        proc.process('');
-        expect(proc.sent).toEqual([]);
-    });
-
-    test('ignores entries without message field', () => {
-        const proc = createProcessor();
-        proc.process(JSON.stringify({ type: 'metadata', foo: 'bar' }));
-        expect(proc.sent).toEqual([]);
-    });
-
-    test('assistant-only text without prior webchat is not mirrored', () => {
-        const proc = createProcessor();
-        proc.process(JSON.stringify({
-            message: {
-                role: 'assistant',
-                content: [{ type: 'text', text: 'orphan reply' }]
-            }
-        }));
-        expect(proc.sent).toEqual([]);
+                content: [
+                    { type: 'thinking', thinking: 'Let me think about this...' },
+                    { type: 'text', text: 'The answer is 42.' },
+                ],
+            },
+        });
+        var entry = JSON.parse(line);
+        var textParts = entry.message.content
+            .filter(function(c) { return c.type === 'text' && c.text; })
+            .map(function(c) { return c.text.trim(); })
+            .filter(function(t) { return t.length > 0; });
+        expect(textParts.join('\n')).toBe('The answer is 42.');
     });
 });
 
-// ============================================================
-// Dedup cache behavior
-// ============================================================
-describe('dedup cache', () => {
-    test('duplicate messages are suppressed', () => {
-        // Simulate the cache logic
-        const cache = new Set();
-        const CACHE_SIZE = 50;
-        const sent = [];
-
-        function fakeSend(text) {
-            if (cache.has(text)) return;
-            cache.add(text);
-            if (cache.size > CACHE_SIZE) {
-                const first = cache.values().next().value;
-                cache.delete(first);
-            }
-            sent.push(text);
-        }
-
-        fakeSend('Hello');
-        fakeSend('Hello');
-        fakeSend('World');
-        expect(sent).toEqual(['Hello', 'World']);
+describe('processLine - integration', function() {
+    beforeEach(function() {
+        webchatRuns.clear();
+        processedRuns.clear();
+        mirroredCache.clear();
     });
 
-    test('cache evicts oldest entries', () => {
-        const cache = new Set();
-        const CACHE_SIZE = 3;
-        const sent = [];
+    test('tracks webchat run start', function() {
+        var line = makeRunStartLine('run-1', 'sess-1', 'webchat');
+        processLine(line);
+        expect(webchatRuns.has('run-1')).toBe(true);
+        expect(webchatRuns.get('run-1')).toBe('sess-1');
+    });
 
-        function fakeSend(text) {
-            if (cache.has(text)) return;
-            cache.add(text);
-            if (cache.size > CACHE_SIZE) {
-                const first = cache.values().next().value;
-                cache.delete(first);
-            }
-            sent.push(text);
+    test('does not track telegram run start', function() {
+        var line = makeRunStartLine('run-2', 'sess-2', 'telegram');
+        processLine(line);
+        expect(webchatRuns.has('run-2')).toBe(false);
+    });
+
+    test('does not track heartbeat run start', function() {
+        var line = makeRunStartLine('run-3', 'sess-3', 'heartbeat');
+        processLine(line);
+        expect(webchatRuns.has('run-3')).toBe(false);
+    });
+
+    test('ignores non-message log entries', function() {
+        var lines = [
+            makeLogLine('gateway/ws', 'webchat connected conn=abc remote=127.0.0.1'),
+            makeLogLine('gateway/ws', 'webchat disconnected code=1006 reason=n/a conn=abc'),
+            makeLogLine('gateway/canvas', 'canvas host mounted at http://127.0.0.1:18789'),
+            makeLogLine('memory', 'openai batch batch_abc validating; waiting 2000ms'),
+            makeLogLine('diagnostic', 'lane dequeue: lane=main waitMs=4 queueSize=0'),
+            makeLogLine('gateway/reload', 'config change detected; evaluating reload'),
+            makePlainLogLine('Registered hook: boot-md -> gateway:startup'),
+            makePlainLogLine('bonjour: advertised gateway fqdn=Titan'),
+        ];
+        for (var i = 0; i < lines.length; i++) {
+            processLine(lines[i]);
         }
+        expect(webchatRuns.size).toBe(0);
+        expect(processedRuns.size).toBe(0);
+    });
 
-        fakeSend('a');
-        fakeSend('b');
-        fakeSend('c');
-        fakeSend('d'); // evicts 'a'
-        fakeSend('a'); // should send again since evicted
-        expect(sent).toEqual(['a', 'b', 'c', 'd', 'a']);
+    test('handles malformed JSON gracefully', function() {
+        expect(function() { processLine('{invalid json'); }).not.toThrow();
+        expect(function() { processLine('random text'); }).not.toThrow();
+        expect(function() { processLine(''); }).not.toThrow();
+        expect(function() { processLine(null); }).not.toThrow();
+    });
+
+    test('deduplication prevents processing same run twice', function() {
+        var startLine = makeRunStartLine('run-dup', 'sess-dup', 'webchat');
+        processLine(startLine);
+        expect(webchatRuns.has('run-dup')).toBe(true);
+
+        var doneLine = makeRunDoneLine('run-dup', 'sess-dup');
+        processLine(doneLine);
+        expect(processedRuns.has('run-dup')).toBe(true);
+
+        // Re-add and try again - should be deduplicated
+        webchatRuns.set('run-dup', 'sess-dup');
+        processLine(doneLine);
+        expect(processedRuns.has('run-dup')).toBe(true);
+    });
+
+    test('does not process run done without matching run start', function() {
+        var doneLine = makeRunDoneLine('orphan-run', 'sess-orphan');
+        processLine(doneLine);
+        expect(processedRuns.has('orphan-run')).toBe(false);
+    });
+
+    test('ignores run done for telegram runs', function() {
+        var startLine = makeRunStartLine('tg-run', 'tg-sess', 'telegram');
+        processLine(startLine);
+        expect(webchatRuns.has('tg-run')).toBe(false);
+
+        var doneLine = makeRunDoneLine('tg-run', 'tg-sess');
+        processLine(doneLine);
+        expect(processedRuns.has('tg-run')).toBe(false);
     });
 });
 
-// ============================================================
-// Truncation
-// ============================================================
-describe('message truncation', () => {
-    test('long messages are truncated at 3900 chars', () => {
-        const maxLen = 3900;
-        const longText = 'x'.repeat(5000);
-        const truncated = longText.length > maxLen
-            ? longText.substring(0, maxLen) + '\n\n[...truncated]'
-            : longText;
-        expect(truncated.length).toBeLessThan(5000);
-        expect(truncated).toContain('[...truncated]');
+describe('deduplication cache', function() {
+    beforeEach(function() {
+        mirroredCache.clear();
     });
 
-    test('short messages are not truncated', () => {
-        const maxLen = 3900;
-        const shortText = 'Hello world';
-        const result = shortText.length > maxLen
-            ? shortText.substring(0, maxLen) + '\n\n[...truncated]'
-            : shortText;
-        expect(result).toBe('Hello world');
+    test('mirroredCache prevents duplicate sends', function() {
+        mirroredCache.add('Hello world');
+        expect(mirroredCache.has('Hello world')).toBe(true);
+        expect(mirroredCache.has('Different text')).toBe(false);
+    });
+
+    test('mirroredCache evicts oldest entries', function() {
+        for (var i = 0; i < 55; i++) {
+            mirroredCache.add('message-' + i);
+            if (mirroredCache.size > 50) {
+                var first = mirroredCache.values().next().value;
+                mirroredCache.delete(first);
+            }
+        }
+        expect(mirroredCache.has('message-0')).toBe(false);
+        expect(mirroredCache.has('message-4')).toBe(false);
+        expect(mirroredCache.has('message-54')).toBe(true);
+    });
+});
+
+describe('echo loop prevention', function() {
+    test('ignores messages with [mirrored] tag', function() {
+        expect(shouldIgnore('[mirrored] This was sent by the daemon')).toBe(true);
+    });
+
+    test('ignores messages containing [mirrored] anywhere', function() {
+        expect(shouldIgnore('prefix [mirrored] suffix')).toBe(true);
+    });
+
+    test('allows messages without [mirrored] tag', function() {
+        expect(shouldIgnore('Normal assistant response')).toBe(false);
+    });
+});
+
+describe('structured subsystem handling', function() {
+    test('correctly identifies agent/embedded subsystem', function() {
+        var entry = JSON.parse(makeRunStartLine('r1', 's1', 'webchat'));
+        expect(parseSubsystem(entry)).toBe('agent/embedded');
+    });
+
+    test('correctly identifies gateway/ws subsystem', function() {
+        var entry = JSON.parse(makeLogLine('gateway/ws', 'webchat connected'));
+        expect(parseSubsystem(entry)).toBe('gateway/ws');
+    });
+
+    test('correctly identifies gateway/channels/telegram subsystem', function() {
+        var entry = JSON.parse(makeLogLine('gateway/channels/telegram', 'starting provider'));
+        expect(parseSubsystem(entry)).toBe('gateway/channels/telegram');
+    });
+
+    test('handles plain string entry[0] without subsystem', function() {
+        var entry = JSON.parse(makePlainLogLine('Registered hook: boot-md'));
+        expect(parseSubsystem(entry)).toBeNull();
+    });
+});
+
+describe('realistic log entry handling', function() {
+    beforeEach(function() {
+        webchatRuns.clear();
+        processedRuns.clear();
+    });
+
+    test('full webchat lifecycle: start -> done', function() {
+        var runId = '6ffd72a2-bea2-4d40-82c9-6532e565c44e';
+        var sessionId = 'ac751bd1-ea97-44c1-a8c0-062999c37b16';
+
+        var startLine = makeLogLine(
+            'agent/embedded',
+            'embedded run start: runId=' + runId + ' sessionId=' + sessionId + ' provider=anthropic model=claude-opus-4-5 thinking=low messageChannel=webchat'
+        );
+        processLine(startLine);
+        expect(webchatRuns.has(runId)).toBe(true);
+
+        // Tool events (should be ignored)
+        processLine(makeLogLine('agent/embedded', 'embedded run tool start: runId=' + runId + ' tool=read toolCallId=toolu_01'));
+        processLine(makeLogLine('agent/embedded', 'embedded run tool end: runId=' + runId + ' tool=read toolCallId=toolu_01'));
+
+        var doneLine = makeLogLine(
+            'agent/embedded',
+            'embedded run done: runId=' + runId + ' sessionId=' + sessionId + ' durationMs=4881 aborted=false'
+        );
+        processLine(doneLine);
+        expect(processedRuns.has(runId)).toBe(true);
+        expect(webchatRuns.has(runId)).toBe(false);
+    });
+
+    test('interleaved webchat and telegram runs', function() {
+        var webchatRun = 'wc-run-1';
+        var telegramRun = 'tg-run-1';
+        var sessionId = 'shared-session';
+
+        processLine(makeRunStartLine(webchatRun, sessionId, 'webchat'));
+        processLine(makeRunStartLine(telegramRun, sessionId, 'telegram'));
+
+        expect(webchatRuns.has(webchatRun)).toBe(true);
+        expect(webchatRuns.has(telegramRun)).toBe(false);
+
+        processLine(makeRunDoneLine(telegramRun, sessionId));
+        expect(processedRuns.has(telegramRun)).toBe(false);
+
+        processLine(makeRunDoneLine(webchatRun, sessionId));
+        expect(processedRuns.has(webchatRun)).toBe(true);
     });
 });
